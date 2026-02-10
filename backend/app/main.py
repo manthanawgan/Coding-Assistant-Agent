@@ -1,90 +1,68 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from contextlib import asynccontextmanager
-import logging
-from sqlalchemy import text
-from app.config.settings import settings
-from app.db.session import engine, Base
-from app.websocket.manager import websocket_manager, router as ws_router
-from app.api.v1.routes import auth, repos, tasks, prs
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from app.config import get_settings
+from app.agents.coding_agent import CodingAgent
+from schemas import ChatRequest, ChatResponse
+from tools.code_parser import CodeParser
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("Starting Coding Assistant Agent API...")
-    try:
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-        logger.info("Database tables initialized")
-    except Exception as e:
-        logger.error(f"Failed to initialize database: {e}")
-    yield
-    logger.info("Shutting down Coding Assistant Agent API...")
-
-
-app = FastAPI(
-    title="Coding Assistant Agent API",
-    description="Autonomous multi-agent software engineering platform",
-    version="1.0.0",
-    lifespan=lifespan
-)
+settings = get_settings()
+app = FastAPI(title=settings.APP_NAME, version=settings.VERSION)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_URL, "http://localhost:3000", "http://frontend:3000"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
-app.include_router(repos.router, prefix="/api/v1/repos", tags=["Repositories"])
-app.include_router(tasks.router, prefix="/api/v1/tasks", tags=["Tasks"])
-app.include_router(prs.router, prefix="/api/v1/prs", tags=["Pull Requests"])
-app.include_router(ws_router, prefix="/ws", tags=["WebSocket"])
 
+agent = CodingAgent()
 
 @app.get("/")
 async def root():
-    return JSONResponse({
-        "message": "Coding Assistant Agent API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "health": "/health"
-    })
+    return {"message": "Coding Assistant API", "version": settings.VERSION}
 
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat(request: ChatRequest):
+    try:
+        history = [{"role": msg.role, "content": msg.content} for msg in request.history]
+        
+        result = await agent.process_request(
+            user_input=request.message,
+            chat_history=history
+        )
+        
+        return ChatResponse(
+            response=result["answer"],
+            thoughts=result.get("thoughts", []),
+            metadata={"iterations": result.get("iterations", 0)}
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/analyze")
+async def analyze_code(code: str):
+    """Analyze code structure"""
+    try:
+        parser = CodeParser()
+        analysis = parser.parse_code(code)
+        complexity = parser.get_code_complexity(code)
+        
+        return {
+            "analysis": analysis,
+            "complexity": complexity
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health")
-async def health_check():
-    redis_status = "unhealthy"
-    try:
-        from redis import asyncio as aioredis
-        redis = aioredis.from_url(settings.REDIS_URL)
-        result = await redis.ping()
-        if result:
-            redis_status = "healthy"
-    except Exception as e:
-        logger.error(f"Redis health check failed: {e}")
-
-    db_status = "unhealthy"
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("SELECT 1"))
-        db_status = "healthy"
-    except Exception as e:
-        logger.error(f"Database health check failed: {e}")
-
-    return JSONResponse({
-        "status": "healthy" if db_status == "healthy" and redis_status == "healthy" else "degraded",
-        "database": db_status,
-        "redis": redis_status,
-        "docker": "healthy"
-    })
-
+async def health():
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
